@@ -49,6 +49,10 @@ pub enum Error {
     #[error(transparent)]
     ParseNum(#[from] num::ParseIntError),
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[error(transparent)]
+    NixError(#[from] nix::Error),
+
     #[cfg(target_os = "windows")]
     #[error(transparent)]
     WintunError(#[from] wintun::Error),
