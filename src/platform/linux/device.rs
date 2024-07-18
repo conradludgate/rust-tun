@@ -13,8 +13,15 @@
 //  0. You just DO WHAT THE FUCK YOU WANT TO.
 
 use libc::{
-    self, c_char, c_short, ifreq, AF_INET, IFF_MULTI_QUEUE, IFF_NO_PI, IFF_RUNNING, IFF_TAP,
-    IFF_TUN, IFF_UP, IFNAMSIZ, O_RDWR, SOCK_DGRAM,
+    self, c_char, c_short, ifreq, IFF_MULTI_QUEUE, IFF_NO_PI, IFF_RUNNING, IFF_TAP, IFF_TUN,
+    IFF_UP, IFNAMSIZ,
+};
+use nix::{
+    fcntl::OFlag,
+    sys::{
+        socket::{AddressFamily, SockFlag, SockProtocol, SockType},
+        stat::Mode,
+    },
 };
 use std::{
     ffi::{CStr, CString},
@@ -45,7 +52,7 @@ pub struct Device {
 impl Device {
     /// Create a new `Device` for the given `Configuration`.
     pub fn new(config: &Configuration) -> Result<Self> {
-        let mut device = unsafe {
+        let mut device = {
             let dev = match config.name.as_ref() {
                 Some(name) => {
                     let name = CString::new(name.clone())?;
@@ -62,14 +69,16 @@ impl Device {
 
             let mut queues = Vec::new();
 
-            let mut req: ifreq = mem::zeroed();
+            let mut req: ifreq = unsafe { mem::zeroed() };
 
             if let Some(dev) = dev.as_ref() {
-                ptr::copy_nonoverlapping(
-                    dev.as_ptr() as *const c_char,
-                    req.ifr_name.as_mut_ptr(),
-                    dev.as_bytes().len(),
-                );
+                unsafe {
+                    ptr::copy_nonoverlapping(
+                        dev.as_ptr() as *const c_char,
+                        req.ifr_name.as_mut_ptr(),
+                        dev.as_bytes_with_nul().len(),
+                    );
+                }
             }
 
             let device_type: c_short = config.layer.unwrap_or(Layer::L3).into();
@@ -87,10 +96,13 @@ impl Device {
                 | if queues_num > 1 { iff_multi_queue } else { 0 };
 
             for _ in 0..queues_num {
-                let tun = Fd::new(libc::open(b"/dev/net/tun\0".as_ptr() as *const _, O_RDWR))
-                    .map_err(|_| io::Error::last_os_error())?;
+                let tun = Fd::new(nix::fcntl::open(
+                    c"/dev/net/tun",
+                    OFlag::O_RDWR,
+                    Mode::empty(),
+                )?)?;
 
-                tunsetiff(tun.0, &mut req as *mut _ as *mut _)?;
+                unsafe { tunsetiff(tun.0, &req as *const _ as *const i32)? };
 
                 queues.push(Queue {
                     tun,
@@ -98,11 +110,19 @@ impl Device {
                 });
             }
 
-            let ctl = Fd::new(libc::socket(AF_INET, SOCK_DGRAM, 0))?;
+            let ctl = Fd::new(
+                nix::sys::socket::socket(
+                    AddressFamily::Inet,
+                    SockType::Datagram,
+                    SockFlag::empty(),
+                    SockProtocol::NetlinkRoute,
+                )?
+                .into_raw_fd(),
+            )?;
 
-            let name = CStr::from_ptr(req.ifr_name.as_ptr())
+            let name = unsafe { CStr::from_ptr(req.ifr_name.as_ptr()) }
                 .to_string_lossy()
-                .to_string();
+                .into_owned();
             Device { name, queues, ctl }
         };
 
@@ -112,15 +132,16 @@ impl Device {
     }
 
     /// Prepare a new request.
-    unsafe fn request(&self) -> ifreq {
-        let mut req: ifreq = mem::zeroed();
-        ptr::copy_nonoverlapping(
-            self.name.as_ptr() as *const c_char,
-            req.ifr_name.as_mut_ptr(),
-            self.name.len(),
-        );
-
-        req
+    fn request(&self) -> ifreq {
+        unsafe {
+            let mut req: ifreq = mem::zeroed();
+            ptr::copy_nonoverlapping(
+                self.name.as_ptr() as *const c_char,
+                req.ifr_name.as_mut_ptr(),
+                self.name.len(),
+            );
+            req
+        }
     }
 
     /// Make the device persistent.
@@ -196,44 +217,42 @@ impl D for Device {
     }
 
     fn set_name(&mut self, value: &str) -> Result<()> {
+        let name = CString::new(value)?;
+
+        if name.as_bytes_with_nul().len() > IFNAMSIZ {
+            return Err(Error::NameTooLong);
+        }
+
+        let mut req = self.request();
         unsafe {
-            let name = CString::new(value)?;
-
-            if name.as_bytes_with_nul().len() > IFNAMSIZ {
-                return Err(Error::NameTooLong);
-            }
-
-            let mut req = self.request();
             ptr::copy_nonoverlapping(
                 name.as_ptr() as *const c_char,
                 req.ifr_ifru.ifru_newname.as_mut_ptr(),
                 value.len(),
             );
-
-            siocsifname(self.ctl.as_raw_fd(), &req)?;
-
-            self.name = value.into();
-
-            Ok(())
         }
+
+        unsafe {
+            siocsifname(self.ctl.as_raw_fd(), &req)?;
+        }
+
+        self.name = value.into();
+
+        Ok(())
     }
 
     fn enabled(&mut self, value: bool) -> Result<()> {
+        let mut req = self.request();
         unsafe {
-            let mut req = self.request();
-
             siocgifflags(self.ctl.as_raw_fd(), &mut req)?;
-
             if value {
                 req.ifr_ifru.ifru_flags |= (IFF_UP | IFF_RUNNING) as c_short;
             } else {
                 req.ifr_ifru.ifru_flags &= !(IFF_UP as c_short);
             }
-
             siocsifflags(self.ctl.as_raw_fd(), &req)?;
-
-            Ok(())
         }
+        Ok(())
     }
 
     fn address(&self) -> Result<Ipv4Addr> {
@@ -247,14 +266,14 @@ impl D for Device {
     }
 
     fn set_address(&mut self, value: Ipv4Addr) -> Result<()> {
+        let mut req = self.request();
+        req.ifr_ifru.ifru_addr = SockAddr::from(value).into();
+
         unsafe {
-            let mut req = self.request();
-            req.ifr_ifru.ifru_addr = SockAddr::from(value).into();
-
             siocsifaddr(self.ctl.as_raw_fd(), &req)?;
-
-            Ok(())
         }
+
+        Ok(())
     }
 
     fn destination(&self) -> Result<Ipv4Addr> {
@@ -268,14 +287,14 @@ impl D for Device {
     }
 
     fn set_destination(&mut self, value: Ipv4Addr) -> Result<()> {
+        let mut req = self.request();
+        req.ifr_ifru.ifru_dstaddr = SockAddr::from(value).into();
+
         unsafe {
-            let mut req = self.request();
-            req.ifr_ifru.ifru_dstaddr = SockAddr::from(value).into();
-
             siocsifdstaddr(self.ctl.as_raw_fd(), &req)?;
-
-            Ok(())
         }
+
+        Ok(())
     }
 
     fn broadcast(&self) -> Result<Ipv4Addr> {
@@ -289,14 +308,14 @@ impl D for Device {
     }
 
     fn set_broadcast(&mut self, value: Ipv4Addr) -> Result<()> {
+        let mut req = self.request();
+        req.ifr_ifru.ifru_broadaddr = SockAddr::from(value).into();
+
         unsafe {
-            let mut req = self.request();
-            req.ifr_ifru.ifru_broadaddr = SockAddr::from(value).into();
-
             siocsifbrdaddr(self.ctl.as_raw_fd(), &req)?;
-
-            Ok(())
         }
+
+        Ok(())
     }
 
     fn netmask(&self) -> Result<Ipv4Addr> {
@@ -310,14 +329,14 @@ impl D for Device {
     }
 
     fn set_netmask(&mut self, value: Ipv4Addr) -> Result<()> {
+        let mut req = self.request();
+        req.ifr_ifru.ifru_netmask = SockAddr::from(value).into();
+
         unsafe {
-            let mut req = self.request();
-            req.ifr_ifru.ifru_netmask = SockAddr::from(value).into();
-
             siocsifnetmask(self.ctl.as_raw_fd(), &req)?;
-
-            Ok(())
         }
+
+        Ok(())
     }
 
     fn mtu(&self) -> Result<i32> {
@@ -331,14 +350,14 @@ impl D for Device {
     }
 
     fn set_mtu(&mut self, value: i32) -> Result<()> {
+        let mut req = self.request();
+        req.ifr_ifru.ifru_mtu = value;
+
         unsafe {
-            let mut req = self.request();
-            req.ifr_ifru.ifru_mtu = value;
-
             siocsifmtu(self.ctl.as_raw_fd(), &req)?;
-
-            Ok(())
         }
+
+        Ok(())
     }
 
     fn queue(&mut self, index: usize) -> Option<&mut Self::Queue> {
